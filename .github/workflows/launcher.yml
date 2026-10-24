@@ -60,26 +60,66 @@ jobs:
           $rel = Invoke-RestMethod https://api.github.com/repos/libsdl-org/SDL/releases/latest
           $ver = $rel.tag_name -replace '^release-',''
           $url = ($rel.assets | Where-Object { $_.name -eq "SDL3-devel-$ver-VC.zip" }).browser_download_url
+          if (-not $url) { throw "SDL3-devel-$ver-VC.zip not found in the latest release" }
           Invoke-WebRequest $url -OutFile sdl3.zip
           Expand-Archive sdl3.zip -DestinationPath sdl3
-          "SDL3_PREFIX=$env:GITHUB_WORKSPACE\sdl3\SDL3-devel-$ver-VC" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure and build
+          # Locate the config instead of assuming the zip's layout.
+          $prefix = Join-Path $env:GITHUB_WORKSPACE "sdl3\SDL3-devel-$ver-VC"
+          $cfg = Get-ChildItem $prefix -Recurse -Filter SDL3Config.cmake | Select-Object -First 1
+          if (-not $cfg) { throw "SDL3Config.cmake not found under $prefix" }
+          "SDL3_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SDL3_DIR=$($cfg.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Using SDL3 config: $($cfg.FullName)"
+
+      - name: Configure
         shell: pwsh
         run: |
-          cmake -S . -B build/launcher `
-            -DNX_GAME=acnh `
-            -DNX_GEN_DIR="$env:GITHUB_WORKSPACE\build\no-gen" `
-            -DCMAKE_PREFIX_PATH="$env:SDL3_PREFIX" `
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/launcher --target acnhrecomp_launcher --config Release
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\build\no-gen" | Out-Null
+          $cmakeArgs = @(
+            "-S", ".",
+            "-B", "build/launcher",
+            "-DNX_GAME=acnh",
+            "-DNX_GEN_DIR=$env:GITHUB_WORKSPACE\build\no-gen",
+            "-DCMAKE_PREFIX_PATH=$env:SDL3_PREFIX",
+            "-DSDL3_DIR=$env:SDL3_DIR",
+            "-DCMAKE_BUILD_TYPE=Release"
+          )
+          cmake @cmakeArgs
+
+          # Fail loudly if the launcher target was not generated (SDL3 not found).
+          if (-not (Test-Path "build/launcher/acnhrecomp_launcher.vcxproj")) {
+            Write-Host "::error::acnhrecomp_launcher.vcxproj missing - SDL3 not found by CMake."
+            Write-Host "SDL3_DIR was: $env:SDL3_DIR"
+            if (Test-Path "build/launcher/CMakeFiles/CMakeConfigureLog.yaml") {
+              Get-Content "build/launcher/CMakeFiles/CMakeConfigureLog.yaml" -Tail 80
+            }
+            exit 1
+          }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build/launcher --target acnhrecomp_launcher --config Release
 
       - name: Stage artifact files
         shell: pwsh
         run: |
+          # Multi-config (VS) puts the exe in Release/; cover single-config too.
+          $exe = @("build/launcher/Release/acnhrecomp_launcher.exe",
+                   "build/launcher/acnhrecomp_launcher.exe") |
+                 Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) { throw "acnhrecomp_launcher.exe not found after build" }
+
+          # SDL's VC package keeps the DLL under lib\x64, not bin\ - find it wherever it is.
+          $dll = Get-ChildItem $env:SDL3_PREFIX -Recurse -Filter SDL3.dll |
+                 Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          if (-not $dll) { $dll = Get-ChildItem $env:SDL3_PREFIX -Recurse -Filter SDL3.dll | Select-Object -First 1 }
+          if (-not $dll) { throw "SDL3.dll not found under $env:SDL3_PREFIX" }
+
           New-Item dist -ItemType Directory -Force | Out-Null
-          Copy-Item build\launcher\Release\acnhrecomp_launcher.exe dist\
-          Copy-Item "$env:SDL3_PREFIX\bin\SDL3.dll" dist\
+          Copy-Item $exe dist/
+          Copy-Item $dll.FullName dist/
+          Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
         with:
