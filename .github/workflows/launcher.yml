@@ -64,10 +64,17 @@ jobs:
           Invoke-WebRequest $url -OutFile sdl3.zip
           Expand-Archive sdl3.zip -DestinationPath sdl3
 
-          # Locate the config instead of assuming the zip's layout.
-          $prefix = Join-Path $env:GITHUB_WORKSPACE "sdl3\SDL3-devel-$ver-VC"
+          # The zip is NAMED SDL3-devel-<ver>-VC.zip but EXTRACTS to a folder named SDL3-<ver>.
+          $prefix = Join-Path $env:GITHUB_WORKSPACE "sdl3\SDL3-$ver"
+          if (-not (Test-Path $prefix)) {
+            # If SDL ever changes the layout again, discover the root instead of failing blind.
+            $prefix = (Get-ChildItem "$env:GITHUB_WORKSPACE\sdl3" -Directory | Select-Object -First 1).FullName
+            Write-Host "::warning::Expected sdl3\SDL3-$ver; falling back to $prefix"
+          }
+
           $cfg = Get-ChildItem $prefix -Recurse -Filter SDL3Config.cmake | Select-Object -First 1
           if (-not $cfg) { throw "SDL3Config.cmake not found under $prefix" }
+
           "SDL3_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
           "SDL3_DIR=$($cfg.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Using SDL3 config: $($cfg.FullName)"
@@ -87,7 +94,7 @@ jobs:
           )
           cmake @cmakeArgs
 
-          # Fail loudly if the launcher target was not generated (SDL3 not found).
+          # Fail loudly if the launcher target was not generated (SDL3 not found by CMake).
           if (-not (Test-Path "build/launcher/acnhrecomp_launcher.vcxproj")) {
             Write-Host "::error::acnhrecomp_launcher.vcxproj missing - SDL3 not found by CMake."
             Write-Host "SDL3_DIR was: $env:SDL3_DIR"
@@ -104,16 +111,19 @@ jobs:
       - name: Stage artifact files
         shell: pwsh
         run: |
-          # Multi-config (VS) puts the exe in Release/; cover single-config too.
           $exe = @("build/launcher/Release/acnhrecomp_launcher.exe",
                    "build/launcher/acnhrecomp_launcher.exe") |
                  Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $exe) { throw "acnhrecomp_launcher.exe not found after build" }
 
-          # SDL's VC package keeps the DLL under lib\x64, not bin\ - find it wherever it is.
+          # The package has three SDL3.dll's (lib\x86, lib\x64, lib\arm64) - must pick x64,
+          # never fall back to arm64/x86.
           $dll = Get-ChildItem $env:SDL3_PREFIX -Recurse -Filter SDL3.dll |
                  Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
-          if (-not $dll) { $dll = Get-ChildItem $env:SDL3_PREFIX -Recurse -Filter SDL3.dll | Select-Object -First 1 }
+          if (-not $dll) {
+            $dll = Get-ChildItem $env:SDL3_PREFIX -Recurse -Filter SDL3.dll |
+                   Where-Object { $_.FullName -notmatch '\\(arm64|x86)\\' } | Select-Object -First 1
+          }
           if (-not $dll) { throw "SDL3.dll not found under $env:SDL3_PREFIX" }
 
           New-Item dist -ItemType Directory -Force | Out-Null
