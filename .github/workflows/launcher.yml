@@ -1,0 +1,88 @@
+name: launcher
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [launcher/**, runtime/**, tools/launcher.sh, .github/workflows/launcher.yml]
+  pull_request:
+    paths: [launcher/**, runtime/**, tools/launcher.sh, .github/workflows/launcher.yml]
+
+concurrency:
+  group: launcher-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain and SDL3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld cmake ninja-build patchelf libsdl3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/launcher -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DNX_GAME=acnh \
+            -DNX_GEN_DIR=${{ github.workspace }}/build/no-gen
+
+      - name: Build
+        run: cmake --build build/launcher --target acnhrecomp_launcher
+
+      - name: Stage artifact files
+        run: |
+          mkdir -p dist
+          cp build/launcher/acnhrecomp_launcher dist/
+          cp "$(ldconfig -p | awk '/libSDL3.so.0/{print $NF; exit}')" dist/
+          patchelf --set-rpath '$ORIGIN' dist/acnhrecomp_launcher
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acnhrecomp_launcher
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get SDL3 (official MSVC devel package)
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod https://api.github.com/repos/libsdl-org/SDL/releases/latest
+          $ver = $rel.tag_name -replace '^release-',''
+          $url = ($rel.assets | Where-Object { $_.name -eq "SDL3-devel-$ver-VC.zip" }).browser_download_url
+          Invoke-WebRequest $url -OutFile sdl3.zip
+          Expand-Archive sdl3.zip -DestinationPath sdl3
+          "SDL3_PREFIX=$env:GITHUB_WORKSPACE\sdl3\SDL3-devel-$ver-VC" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S . -B build/launcher `
+            -DNX_GAME=acnh `
+            -DNX_GEN_DIR="$env:GITHUB_WORKSPACE\build\no-gen" `
+            -DCMAKE_PREFIX_PATH="$env:SDL3_PREFIX" `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/launcher --target acnhrecomp_launcher --config Release
+
+      - name: Stage artifact files
+        shell: pwsh
+        run: |
+          New-Item dist -ItemType Directory -Force | Out-Null
+          Copy-Item build\launcher\Release\acnhrecomp_launcher.exe dist\
+          Copy-Item "$env:SDL3_PREFIX\bin\SDL3.dll" dist\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acnhrecomp_launcher-windows
+          path: dist/
+          if-no-files-found: error
